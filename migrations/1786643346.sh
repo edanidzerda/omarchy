@@ -125,7 +125,43 @@ unverified_repairs_exist() {
 # A browser only rewrites its own Preferences on exit, so a repair can only be
 # reverted by a browser attached to a profile this migration has to touch.
 # SingletonLock contains a hostname and PID and can be left behind after a
-# crash, so trust it only when it names a live process on this host.
+# crash, so trust it only when it names a live process using this data directory.
+pid_uses_profile() {
+  local pid=$1 profile=$2 argument user_data_dir="" expecting_user_data_dir=0
+  local canonical_profile
+
+  canonical_profile=$(readlink -f -- "$profile") || return 1
+  while IFS= read -r -d '' argument; do
+    if (( expecting_user_data_dir )); then
+      user_data_dir=$argument
+      break
+    elif [[ $argument == --user-data-dir=* ]]; then
+      user_data_dir=${argument#--user-data-dir=}
+      break
+    elif [[ $argument == --user-data-dir ]]; then
+      expecting_user_data_dir=1
+    fi
+  done <"/proc/$pid/cmdline"
+
+  [[ -n $user_data_dir && $(readlink -f -- "$user_data_dir") == "$canonical_profile" ]]
+}
+
+singleton_socket_open() {
+  python3 -c '
+import socket
+import sys
+
+connection = socket.socket(socket.AF_UNIX)
+connection.settimeout(0.1)
+try:
+    connection.connect(sys.argv[1])
+except OSError:
+    sys.exit(1)
+finally:
+    connection.close()
+' "$1"
+}
+
 profile_open() {
   local profile=$1 lock pid hostname
 
@@ -133,13 +169,14 @@ profile_open() {
   if lock=$(readlink "$profile/SingletonLock" 2>/dev/null) &&
     [[ ${lock%-*} == "$hostname" ]]; then
     pid=${lock##*-}
-    if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
-      kill -0 "$pid" 2>/dev/null
+    if [[ $pid =~ ^[1-9][0-9]*$ ]] &&
+      kill -0 "$pid" 2>/dev/null &&
+      pid_uses_profile "$pid" "$profile"; then
       return
     fi
   fi
 
-  [[ -S $profile/SingletonSocket ]]
+  [[ -S $profile/SingletonSocket ]] && singleton_socket_open "$profile/SingletonSocket"
 }
 
 # Gate on a pending — or to-be-verified — profile actually being open, not on

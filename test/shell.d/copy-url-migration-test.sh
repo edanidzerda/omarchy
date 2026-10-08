@@ -12,6 +12,7 @@ test_home="$test_tmp/stale-lock-home"
 stale_profiles=(
   "$test_home/.config/chromium"
   "$test_home/.config/BraveSoftware/Brave-Browser"
+  "$test_home/.config/google-chrome"
 )
 stale_socket_paths=(
   "$test_home/.config/chromium/SingletonSocket"
@@ -32,7 +33,13 @@ for profile in "${stale_profiles[@]}"; do
 JSON
 
   # Chromium-family browsers leave host-PID symlinks and socket paths behind after a crash.
-  ln -s "$hostname-$dead_pid" "$profile/SingletonLock"
+  lock_pid=$dead_pid
+  if [[ $profile == "$test_home/.config/google-chrome" ]]; then
+    # Simulate a stale lock whose PID has been reused by this unrelated test
+    # process. It is live, but its command line does not identify this profile.
+    lock_pid=$$
+  fi
+  ln -s "$hostname-$lock_pid" "$profile/SingletonLock"
 done
 
 python3 - "${stale_socket_paths[@]}" <<'PY'
@@ -64,36 +71,28 @@ for profile in "${stale_profiles[@]}"; do
   [[ -f $profile/Default/Preferences.omarchy-copy-url-repair.bak ]] ||
     fail "the stale profile $profile gets a repair backup"
 done
-pass "stale Chromium and Brave singleton files do not block the shortcut repair"
+pass "stale singleton files and a reused PID do not block the shortcut repair"
 
 active_home="$test_tmp/active-lock-home"
-active_profiles=(
-  "$active_home/.config/chromium"
-  "$active_home/.config/BraveSoftware/Brave-Browser"
-)
-socket_paths=("$test_tmp/chromium-SingletonSocket" "$test_tmp/brave-SingletonSocket")
+active_profile="$active_home/.config/BraveSoftware/Brave-Browser"
+socket_path="$test_tmp/brave-SingletonSocket"
 ready="$test_tmp/socket-ready"
 mkdir -p "$test_tmp/bin"
-for profile in "${active_profiles[@]}"; do
-  active_preferences="$profile/Default/Preferences"
-  mkdir -p "$(dirname "$active_preferences")"
-  cat >"$active_preferences" <<'JSON'
+active_preferences="$active_profile/Default/Preferences"
+mkdir -p "$(dirname "$active_preferences")"
+cat >"$active_preferences" <<'JSON'
 {"extensions":{"commands":{"linux:Alt+Shift+L":{"command_name":"copy-url","extension":"fpogfhkjagaffemmbnnnoklcppehefdo"}},"settings":{"fpogfhkjagaffemmbnnnoklcppehefdo":{"path":"/usr/share/omarchy/default/chromium/extensions/copy-url"}}}}
 JSON
-done
 
-python3 - "${socket_paths[@]}" "$ready" <<'PY' &
+python3 - "$socket_path" "$ready" <<'PY' &
 import socket
 import sys
 import time
 
-servers = []
-for path in sys.argv[1:-1]:
-    server = socket.socket(socket.AF_UNIX)
-    server.bind(path)
-    server.listen()
-    servers.append(server)
-open(sys.argv[-1], "w").close()
+server = socket.socket(socket.AF_UNIX)
+server.bind(sys.argv[1])
+server.listen()
+open(sys.argv[2], "w").close()
 time.sleep(30)
 PY
 socket_pid=$!
@@ -104,15 +103,13 @@ cleanup_socket() {
 trap 'cleanup_socket; rm -rf "$test_tmp"' EXIT
 
 for attempt in {1..50}; do
-  [[ -S ${socket_paths[0]} && -S ${socket_paths[1]} && -f $ready ]] && break
+  [[ -S $socket_path && -f $ready ]] && break
   sleep 0.1
 done
-[[ -S ${socket_paths[0]} && -S ${socket_paths[1]} && -f $ready ]] ||
-  fail "the test Chromium and Brave sockets start"
-ln -s "$hostname-$socket_pid" "${active_profiles[0]}/SingletonLock"
-ln -s "${socket_paths[0]}" "${active_profiles[0]}/SingletonSocket"
-ln -s "foreign-$hostname-123" "${active_profiles[1]}/SingletonLock"
-ln -s "${socket_paths[1]}" "${active_profiles[1]}/SingletonSocket"
+[[ -S $socket_path && -f $ready ]] ||
+  fail "the test Brave socket starts"
+ln -s "foreign-$hostname-123" "$active_profile/SingletonLock"
+ln -s "$socket_path" "$active_profile/SingletonSocket"
 
 cat >"$test_tmp/bin/gum" <<'SH'
 #!/bin/bash
@@ -128,8 +125,6 @@ if HOME="$active_home" OMARCHY_PATH="$ROOT" PATH="$test_tmp/bin:$PATH" \
 fi
 grep -q "A running browser would undo the Copy URL shortcut repair" "$test_tmp/active-lock.out" ||
   fail "the active-profile failure explains why the repair is deferred" "$(cat "$test_tmp/active-lock.out")"
-for profile in "${active_profiles[@]}"; do
-  [[ ! -e $profile/Default/Preferences.omarchy-copy-url-repair.bak ]] ||
-    fail "the migration does not edit active profile $profile"
-done
-pass "live Chromium and Brave SingletonSockets block the shortcut repair"
+[[ ! -e $active_preferences.omarchy-copy-url-repair.bak ]] ||
+  fail "the migration does not edit the active profile"
+pass "a live Brave SingletonSocket blocks repair with a foreign-host lock"
