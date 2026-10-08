@@ -124,12 +124,22 @@ unverified_repairs_exist() {
 
 # A browser only rewrites its own Preferences on exit, so a repair can only be
 # reverted by a browser attached to a profile this migration has to touch.
-# Whether a profile is open is mechanical: a running Chromium-family browser
-# holds a SingletonLock (and socket) inside its user-data-dir.
+# SingletonLock contains a hostname and PID and can be left behind after a
+# crash, so trust it only when it names a live process on this host.
 profile_open() {
-  # -L catches a SingletonLock left as a dangling symlink; -e covers a plain
-  # file, and -S the socket — any of them means a browser is attached.
-  [[ -L $1/SingletonLock || -e $1/SingletonLock || -S $1/SingletonSocket ]]
+  local profile=$1 lock pid hostname
+
+  hostname=$(</proc/sys/kernel/hostname)
+  if lock=$(readlink "$profile/SingletonLock" 2>/dev/null) &&
+    [[ ${lock%-*} == "$hostname" ]]; then
+    pid=${lock##*-}
+    if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
+      kill -0 "$pid" 2>/dev/null
+      return
+    fi
+  fi
+
+  [[ -S $profile/SingletonSocket ]]
 }
 
 # Gate on a pending — or to-be-verified — profile actually being open, not on
