@@ -96,9 +96,14 @@ open(sys.argv[2], "w").close()
 time.sleep(30)
 PY
 socket_pid=$!
+profile_pid=""
 cleanup_socket() {
   kill "$socket_pid" 2>/dev/null || true
   wait "$socket_pid" 2>/dev/null || true
+  if [[ -n $profile_pid ]]; then
+    kill "$profile_pid" 2>/dev/null || true
+    wait "$profile_pid" 2>/dev/null || true
+  fi
 }
 trap 'cleanup_socket; rm -rf "$test_tmp"' EXIT
 
@@ -128,3 +133,39 @@ grep -q "A running browser would undo the Copy URL shortcut repair" "$test_tmp/a
 [[ ! -e $active_preferences.omarchy-copy-url-repair.bak ]] ||
   fail "the migration does not edit the active profile"
 pass "a live Brave SingletonSocket blocks repair with a foreign-host lock"
+
+pid_home="$test_tmp/active-pid-home"
+pid_profile="$pid_home/.config/chromium"
+pid_preferences="$pid_profile/Default/Preferences"
+pid_ready="$test_tmp/profile-process-ready"
+mkdir -p "$(dirname "$pid_preferences")"
+cat >"$pid_preferences" <<'JSON'
+{"extensions":{"commands":{"linux:Alt+Shift+L":{"command_name":"copy-url","extension":"fpogfhkjagaffemmbnnnoklcppehefdo"}},"settings":{"fpogfhkjagaffemmbnnnoklcppehefdo":{"path":"/usr/share/omarchy/default/chromium/extensions/copy-url"}}}}
+JSON
+
+python3 -c 'import sys, time; open(sys.argv[-1], "w").close(); time.sleep(30)' \
+  --user-data-dir "$pid_profile" "$pid_ready" &
+profile_pid=$!
+for attempt in {1..50}; do
+  [[ -f $pid_ready ]] && break
+  sleep 0.1
+done
+[[ -f $pid_ready ]] || fail "the process for the same-host lock starts"
+ln -s "$hostname-$profile_pid" "$pid_profile/SingletonLock"
+
+if HOME="$pid_home" OMARCHY_PATH="$ROOT" PATH="$test_tmp/bin:$PATH" \
+  TEST_GUM_LOG="$test_tmp/pid-gum.log" \
+  bash -euo pipefail "$migration" >"$test_tmp/active-pid.out" 2>&1; then
+  kill "$profile_pid" 2>/dev/null || true
+  wait "$profile_pid" 2>/dev/null || true
+  fail "the migration remains pending when the same-host profile process is live"
+fi
+kill "$profile_pid" 2>/dev/null || true
+wait "$profile_pid" 2>/dev/null || true
+grep -q "A running browser would undo the Copy URL shortcut repair" "$test_tmp/active-pid.out" ||
+  fail "the same-host PID failure explains why the repair is deferred" "$(cat "$test_tmp/active-pid.out")"
+[[ ! -e $pid_preferences.omarchy-copy-url-repair.bak ]] ||
+  fail "the migration does not edit the profile identified by the live PID"
+[[ ! -e $pid_profile/SingletonSocket ]] ||
+  fail "the same-host PID case has no socket to trigger the fallback"
+pass "a live same-host PID using the profile blocks repair"
